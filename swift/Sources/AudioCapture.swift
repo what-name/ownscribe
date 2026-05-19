@@ -369,12 +369,10 @@ class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         guard status == noErr else { return }
 
         // Convert non-interleaved → interleaved if needed, then write
-        var writtenBuffer: AVAudioPCMBuffer = pcmBuffer
         do {
             if sampleFormat.isInterleaved {
                 try audioFile.write(from: pcmBuffer)
             } else {
-                // Lazily create converter matching this source format
                 if audioConverter?.inputFormat != sampleFormat {
                     let interleavedFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32,
                                                        sampleRate: sampleFormat.sampleRate,
@@ -387,7 +385,6 @@ class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
                     guard let outBuffer = AVAudioPCMBuffer(pcmFormat: outFmt, frameCapacity: frameCount) else { return }
                     try converter.convert(to: outBuffer, from: pcmBuffer)
                     try audioFile.write(from: outBuffer)
-                    writtenBuffer = outBuffer
                 }
             }
         } catch {
@@ -396,9 +393,10 @@ class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
 
         totalFrames += Int64(frameCount)
 
-        // Peak detection on the written (interleaved) buffer
-        let bufferPeak: Float = writtenBuffer.floatChannelData.map {
-            computePeakLevel(in: $0, channels: Int(writtenBuffer.format.channelCount), frames: Int(writtenBuffer.frameLength))
+        // Peak detection on the original SCK buffer (non-interleaved — floatChannelData
+        // returns nil for interleaved buffers, so we must use the pre-conversion buffer)
+        let bufferPeak: Float = pcmBuffer.floatChannelData.map {
+            computePeakLevel(in: $0, channels: Int(pcmBuffer.format.channelCount), frames: Int(pcmBuffer.frameLength))
         } ?? 0.0
         if bufferPeak > self.peakLevel { self.peakLevel = bufferPeak }
 

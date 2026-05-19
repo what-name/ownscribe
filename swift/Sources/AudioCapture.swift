@@ -229,19 +229,28 @@ class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, SCContentS
         super.init()
     }
 
-    func start() async throws {
-        // Configure and show the content sharing picker
-        let picker = SCContentSharingPicker.shared
-        var pickerConfig = SCContentSharingPickerConfiguration()
-        pickerConfig.allowedPickerModes = [.singleWindow, .singleDisplay, .singleApplication]
-        picker.defaultConfiguration = pickerConfig
-        picker.add(self)
-        picker.isActive = true
-        picker.present()
+    var captureModeAll: Bool = false
 
-        // Suspend until the picker delegate fires
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            self.startContinuation = continuation
+    func start() async throws {
+        if captureModeAll {
+            let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false)
+            guard let display = content.displays.first else {
+                throw CaptureError.noDisplay
+            }
+            let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
+            try await self.beginCapture(with: filter)
+        } else {
+            let picker = SCContentSharingPicker.shared
+            var pickerConfig = SCContentSharingPickerConfiguration()
+            pickerConfig.allowedPickerModes = [.singleWindow, .singleDisplay, .singleApplication]
+            picker.defaultConfiguration = pickerConfig
+            picker.add(self)
+            picker.isActive = true
+            picker.present()
+
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                self.startContinuation = continuation
+            }
         }
     }
 
@@ -732,6 +741,7 @@ func printUsage() {
         --output, -o FILE    Output WAV file path (required for capture)
         --mic                Also capture microphone input
         --mic-device NAME    Use specific mic input device (implies --mic)
+        --capture-mode-all   Capture all system audio without showing the source picker
         --silence-timeout N  Auto-stop after N seconds of silence (0 = disabled)
         --help, -h           Show this help
 
@@ -767,6 +777,7 @@ func main() {
         var outputPath: String?
         var enableMic = false
         var micDeviceName: String?
+        var captureModeAll = false
         var silenceTimeout: TimeInterval = 0
 
         var i = 2
@@ -779,6 +790,8 @@ func main() {
                     exit(1)
                 }
                 outputPath = args[i]
+            case "--capture-mode-all":
+                captureModeAll = true
             case "--mic":
                 enableMic = true
             case "--mic-device":
@@ -819,6 +832,7 @@ func main() {
         let micPath = output + ".mic.tmp.wav"
 
         let capture = SystemAudioCapture(outputPath: systemPath)
+        capture.captureModeAll = captureModeAll
         capture.silenceTimeout = silenceTimeout
         var micCapture: MicCapture?
 

@@ -29,6 +29,22 @@ from ownscribe.summarization import create_summarizer
 _WAV_HEADER_SIZE = 44
 
 
+def _log_crash(out_dir: Path, exit_code: int | None, stderr_output: str, elapsed: float) -> None:
+    """Write a crash log alongside the recording for post-mortem debugging."""
+    crash_log = out_dir / "crash.log"
+    mins, secs = divmod(int(elapsed), 60)
+    lines = [
+        f"Recording crashed at {mins:02d}:{secs:02d}",
+        f"Time: {datetime.now().isoformat()}",
+        f"Exit code: {exit_code}",
+        "",
+        "--- stderr ---",
+        stderr_output.strip() if stderr_output else "(empty)",
+    ]
+    crash_log.write_text("\n".join(lines) + "\n")
+    click.echo(f"  Crash log saved to {crash_log}", err=True)
+
+
 def _check_audio_silence(audio_path: Path) -> None:
     """Check if the recorded audio is silent and warn the user."""
     try:
@@ -230,8 +246,21 @@ def run_pipeline(config: Config) -> None:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_termios)
         signal.signal(signal.SIGINT, original_handler)
 
+    elapsed = time.time() - start_time
+    mins, secs = divmod(int(elapsed), 60)
+
     recorder.stop()
-    if getattr(recorder, "silence_timed_out", False):
+
+    if getattr(recorder, "crashed", False):
+        exit_code = getattr(recorder, "exit_code", None)
+        stderr_output = getattr(recorder, "stderr_output", "")
+        click.echo(
+            f"\n\n  Recording process crashed at {mins:02d}:{secs:02d} "
+            f"(exit code: {exit_code})",
+            err=True,
+        )
+        _log_crash(out_dir, exit_code, stderr_output, elapsed)
+    elif getattr(recorder, "silence_timed_out", False):
         click.echo("\n\nRecording auto-stopped after silence timeout.")
     else:
         click.echo("\n\nStopping recording...")
@@ -244,7 +273,10 @@ def run_pipeline(config: Config) -> None:
         )
         raise SystemExit(1)
 
-    click.echo(f"Audio saved to {audio_path}\n")
+    if getattr(recorder, "crashed", False):
+        click.echo(f"Audio recovered to {audio_path}\n")
+    else:
+        click.echo(f"Audio saved to {audio_path}\n")
 
     # Check for silent audio before spending time on transcription
     # Skip if the recorder already reported a silence warning (CoreAudio helper)

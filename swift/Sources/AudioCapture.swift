@@ -114,7 +114,11 @@ class MicCapture {
                     os_unfair_lock_unlock(&self._lastLoudTimeLock)
                 }
             }
-            try? self.audioFile?.write(from: buffer)
+            do {
+                try self.audioFile?.write(from: buffer)
+            } catch {
+                fputs("Mic write error: \(error)\n", stderr)
+            }
         }
         try engine.start()
         fputs("Recording microphone audio to \(outputPath)...\n", stderr)
@@ -190,7 +194,7 @@ func findInputDevice(named name: String) throws -> AudioDeviceID {
 
 // MARK: - System Audio Capture via ScreenCaptureKit
 
-class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, SCContentSharingPickerObserver {
+class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     private var stream: SCStream?
     private var audioFile: AVAudioFile?
     private var audioConverter: AVAudioConverter?
@@ -215,8 +219,11 @@ class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, SCContentS
     private var lastLoudTimeLock = os_unfair_lock_s()
     private var silenceTimer: DispatchSourceTimer?
 
-    // Picker continuation
-    private var startContinuation: CheckedContinuation<Void, Error>?
+    // Watchdog: detect if SCStream stops delivering callbacks silently
+    private var lastCallbackTime: UInt64 = 0
+    private var lastCallbackTimeLock = os_unfair_lock_s()
+    private var watchdogTimer: DispatchSourceTimer?
+    private let watchdogDeadline: TimeInterval = 10  // seconds with no callbacks = dead
 
     init(outputPath: String) {
         self.outputPath = outputPath
@@ -224,44 +231,12 @@ class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, SCContentS
     }
 
     func start() async throws {
-        // Configure and show the content sharing picker
-        let picker = SCContentSharingPicker.shared
-        var pickerConfig = SCContentSharingPickerConfiguration()
-        pickerConfig.allowedPickerModes = [.singleWindow, .singleDisplay, .singleApplication]
-        picker.defaultConfiguration = pickerConfig
-        picker.add(self)
-        picker.isActive = true
-        picker.present()
-
-        // Suspend until the picker delegate fires
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            self.startContinuation = continuation
+        let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false)
+        guard let display = content.displays.first else {
+            throw CaptureError.noDisplay
         }
-    }
-
-    // MARK: - SCContentSharingPickerObserver
-
-    func contentSharingPicker(_ picker: SCContentSharingPicker, didUpdateWith filter: SCContentFilter, for stream: SCStream?) {
-        Task {
-            do {
-                try await self.beginCapture(with: filter)
-                self.startContinuation?.resume()
-                self.startContinuation = nil
-            } catch {
-                self.startContinuation?.resume(throwing: error)
-                self.startContinuation = nil
-            }
-        }
-    }
-
-    func contentSharingPicker(_ picker: SCContentSharingPicker, didCancelFor stream: SCStream?) {
-        fputs("Content picker cancelled.\n", stderr)
-        exit(0)
-    }
-
-    func contentSharingPickerStartDidFailWithError(_ error: Error) {
-        self.startContinuation?.resume(throwing: error)
-        self.startContinuation = nil
+        let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
+        try await self.beginCapture(with: filter)
     }
 
     // MARK: - Begin Capture
@@ -271,15 +246,15 @@ class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, SCContentS
         let config = SCStreamConfiguration()
         config.capturesAudio = true
         config.excludesCurrentProcessAudio = true
-        config.sampleRate = 48000
-        config.channelCount = 2
+        config.sampleRate = 24000
+        config.channelCount = 1
         config.width = 2
         config.height = 2
         config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
         config.showsCursor = false
 
         // Create AVAudioFile for WAV output (interleaved to avoid CoreAudio warning)
-        let fileFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 2, interleaved: true)!
+        let fileFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 24000, channels: 1, interleaved: true)!
         let audioFile = try AVAudioFile(forWriting: URL(fileURLWithPath: outputPath),
                                          settings: fileFormat.settings,
                                          commonFormat: .pcmFormatFloat32,
@@ -295,10 +270,35 @@ class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, SCContentS
             lastLoudTime = DispatchTime.now().uptimeNanoseconds
         }
 
+        // Initialize watchdog timestamp before starting capture (no lock needed — callbacks haven't started)
+        lastCallbackTime = DispatchTime.now().uptimeNanoseconds
+
         try await stream.startCapture()
         self.stream = stream
 
         fputs("Recording system audio to \(outputPath)... Press Ctrl+C to stop.\n", stderr)
+
+        // Watchdog: detect if SCStream silently stops delivering audio callbacks.
+        // Fires every 5s, triggers stream error if no callback for watchdogDeadline seconds.
+        let wd = DispatchSource.makeTimerSource(queue: .main)
+        wd.schedule(deadline: .now() + 5, repeating: 5.0)
+        wd.setEventHandler { [weak self] in
+            guard let self else { return }
+            let now = DispatchTime.now().uptimeNanoseconds
+            os_unfair_lock_lock(&self.lastCallbackTimeLock)
+            let lastCb = self.lastCallbackTime
+            os_unfair_lock_unlock(&self.lastCallbackTimeLock)
+            guard now >= lastCb else { return }
+            let gap = Double(now - lastCb) / 1_000_000_000.0
+            if gap > self.watchdogDeadline {
+                fputs("[STREAM_ERROR] No audio callbacks for \(String(format: "%.0f", gap))s — stream appears dead\n", stderr)
+                self.watchdogTimer?.cancel()
+                self.watchdogTimer = nil
+                self.onStreamError?(CaptureError.noDisplay)
+            }
+        }
+        wd.resume()
+        watchdogTimer = wd
 
         // Start silence timeout timer if configured.
         // Checks every 1s whether both system audio and mic (if active) have been
@@ -320,6 +320,8 @@ class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, SCContentS
                         effectiveLastLoud = micLastLoud
                     }
                 }
+                // Guard against clock skew — if lastLoudTime is ahead of now, skip this tick
+                guard now >= effectiveLastLoud else { return }
                 let elapsed = Double(now - effectiveLastLoud) / 1_000_000_000.0
                 if elapsed > self.silenceTimeout {
                     fputs("[SILENCE_TIMEOUT]\n", stderr)
@@ -339,6 +341,11 @@ class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, SCContentS
         guard type == .audio else { return }
         guard let audioFile else { return }
         guard CMSampleBufferGetNumSamples(sampleBuffer) > 0 else { return }
+
+        // Update watchdog timestamp
+        os_unfair_lock_lock(&lastCallbackTimeLock)
+        lastCallbackTime = DispatchTime.now().uptimeNanoseconds
+        os_unfair_lock_unlock(&lastCallbackTimeLock)
 
         // Capture start host time from first audio buffer
         if startHostTime == 0 {
@@ -362,12 +369,13 @@ class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, SCContentS
         guard status == noErr else { return }
 
         // Convert non-interleaved → interleaved if needed, then write
+        var writtenBuffer: AVAudioPCMBuffer = pcmBuffer
         do {
             if sampleFormat.isInterleaved {
                 try audioFile.write(from: pcmBuffer)
             } else {
                 // Lazily create converter matching this source format
-                if audioConverter == nil || audioConverter!.inputFormat != sampleFormat {
+                if audioConverter?.inputFormat != sampleFormat {
                     let interleavedFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32,
                                                        sampleRate: sampleFormat.sampleRate,
                                                        channels: sampleFormat.channelCount,
@@ -379,6 +387,7 @@ class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, SCContentS
                     guard let outBuffer = AVAudioPCMBuffer(pcmFormat: outFmt, frameCapacity: frameCount) else { return }
                     try converter.convert(to: outBuffer, from: pcmBuffer)
                     try audioFile.write(from: outBuffer)
+                    writtenBuffer = outBuffer
                 }
             }
         } catch {
@@ -387,9 +396,9 @@ class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, SCContentS
 
         totalFrames += Int64(frameCount)
 
-        // Peak detection on float channel data
-        let bufferPeak: Float = pcmBuffer.floatChannelData.map {
-            computePeakLevel(in: $0, channels: Int(sampleFormat.channelCount), frames: Int(frameCount))
+        // Peak detection on the written (interleaved) buffer
+        let bufferPeak: Float = writtenBuffer.floatChannelData.map {
+            computePeakLevel(in: $0, channels: Int(writtenBuffer.format.channelCount), frames: Int(writtenBuffer.frameLength))
         } ?? 0.0
         if bufferPeak > self.peakLevel { self.peakLevel = bufferPeak }
 
@@ -401,7 +410,7 @@ class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, SCContentS
         }
 
         // Check for silence after ~3 seconds of data
-        if !silenceChecked && totalFrames > 48000 * 3 {
+        if !silenceChecked && totalFrames > 24000 * 3 {
             silenceChecked = true
             if peakLevel < 1e-6 {
                 silenceWarned = true
@@ -413,8 +422,11 @@ class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, SCContentS
 
     // MARK: - SCStreamDelegate
 
+    var onStreamError: ((Error) -> Void)?
+
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        fputs("Stream error: \(error)\n", stderr)
+        fputs("[STREAM_ERROR] \(error)\n", stderr)
+        onStreamError?(error)
     }
 
     // MARK: - Stop
@@ -422,6 +434,8 @@ class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, SCContentS
     func stop() {
         silenceTimer?.cancel()
         silenceTimer = nil
+        watchdogTimer?.cancel()
+        watchdogTimer = nil
 
         let sem = DispatchSemaphore(value: 0)
         Task.detached { [stream] in
@@ -433,7 +447,7 @@ class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, SCContentS
         // AVAudioFile finalizes on close
         audioFile = nil
 
-        let seconds = Double(totalFrames) / 48000.0
+        let seconds = Double(totalFrames) / 24000.0
         fputs("Saved \(outputPath) (\(String(format: "%.1f", seconds)) seconds, peak=\(String(format: "%.6f", peakLevel)))\n", stderr)
         if totalFrames > 0 && peakLevel < 1e-6 {
             fputs("[SILENCE_WARNING] Recording appears silent. Check Screen Recording permission.\n", stderr)
@@ -557,8 +571,8 @@ func mergeAudioFiles(systemPath: String, micPath: String,
         ? try AVAudioFile(forReading: URL(fileURLWithPath: systemPath)) : nil
     let micFile = try AVAudioFile(forReading: URL(fileURLWithPath: micPath))
 
-    let outputSampleRate: Double = 48000
-    let outputChannels: AVAudioChannelCount = 2
+    let outputSampleRate: Double = 24000
+    let outputChannels: AVAudioChannelCount = 1
 
     // Compute offset in seconds between the two start times using mach_timebase_info
     let offsetFrames: Int64
@@ -625,9 +639,16 @@ func mergeAudioFiles(systemPath: String, micPath: String,
                     if let sysBuf = AVAudioPCMBuffer(pcmFormat: systemFile.processingFormat, frameCapacity: sysReadCount) {
                         try systemFile.read(into: sysBuf, frameCount: sysReadCount)
                         let sysData = sysBuf.floatChannelData!
+                        let sysCh = Int(sysBuf.format.channelCount)
                         for i in 0..<Int(sysBuf.frameLength) {
-                            outPtr[i * 2] += sysData[0][i]
-                            outPtr[i * 2 + 1] += sysData[1][i]
+                            if outputChannels == 1 {
+                                var mix: Float = 0
+                                for ch in 0..<sysCh { mix += sysData[ch][i] }
+                                outPtr[i] += mix / Float(sysCh)
+                            } else {
+                                outPtr[i * 2] += sysData[0][i]
+                                outPtr[i * 2 + 1] += sysCh > 1 ? sysData[1][i] : sysData[0][i]
+                            }
                         }
                     }
                 }
@@ -743,7 +764,6 @@ func main() {
         listInputDevices()
 
     case "capture":
-        // Initialize NSApplication so the picker GUI can render
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
 
@@ -817,8 +837,8 @@ func main() {
             capture.micCapture = mic
         }
 
-        // Shared shutdown logic for SIGINT, SIGTERM, and silence timeout
-        let shutdown: () -> Void = {
+        // Shared shutdown logic — exitCode 0 for normal stop, non-zero for crashes
+        let shutdown: (Int32) -> Void = { exitCode in
             capture.stop()
             if let mic = micCapture {
                 mic.stop()
@@ -833,10 +853,15 @@ func main() {
                     fputs("Error merging audio: \(error)\n", stderr)
                 }
             }
-            exit(0)
+            exit(exitCode)
         }
 
-        capture.onSilenceTimeout = shutdown
+        capture.onSilenceTimeout = { shutdown(0) }
+
+        capture.onStreamError = { error in
+            fputs("[STREAM_DIED] ScreenCaptureKit stream stopped unexpectedly: \(error)\n", stderr)
+            shutdown(2)
+        }
 
         // Toggle mic mute on SIGUSR1 (sent by Python wrapper)
         var _sigusr1Source: DispatchSourceSignal?  // retained to keep source alive
@@ -852,12 +877,12 @@ func main() {
         // Handle Ctrl+C gracefully
         let sigintSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
         signal(SIGINT, SIG_IGN)
-        sigintSource.setEventHandler { shutdown() }
+        sigintSource.setEventHandler { shutdown(0) }
         sigintSource.resume()
 
         let sigtermSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
         signal(SIGTERM, SIG_IGN)
-        sigtermSource.setEventHandler { shutdown() }
+        sigtermSource.setEventHandler { shutdown(0) }
         sigtermSource.resume()
 
         Task {

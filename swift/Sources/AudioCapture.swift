@@ -6,6 +6,7 @@ import Foundation
 import AppKit
 import CoreAudio
 import AudioToolbox
+import IOKit.pwr_mgt
 
 // MARK: - Constants
 
@@ -227,6 +228,9 @@ class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, SCContentS
     private var watchdogTimer: DispatchSourceTimer?
     private let watchdogDeadline: TimeInterval = 10
 
+    // Power assertion to prevent display sleep during capture
+    private var powerAssertionID: IOPMAssertionID = IOPMAssertionID(kIOPMNullAssertionID)
+
     // Picker continuation
     private var startContinuation: CheckedContinuation<Void, Error>?
 
@@ -320,6 +324,14 @@ class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, SCContentS
 
         try await stream.startCapture()
         self.stream = stream
+
+        // Prevent macOS from sleeping the display while recording — without this,
+        // idle timeout kills the SCStream (error -3821) especially on battery.
+        IOPMAssertionCreateWithName(
+            kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString,
+            IOPMAssertionLevel(kIOPMAssertionLevelOn),
+            "ownscribe is recording audio" as CFString,
+            &powerAssertionID)
 
         fputs("Recording system audio to \(outputPath)... Press Ctrl+C to stop.\n", stderr)
 
@@ -478,6 +490,11 @@ class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, SCContentS
         silenceTimer = nil
         watchdogTimer?.cancel()
         watchdogTimer = nil
+
+        if powerAssertionID != IOPMAssertionID(kIOPMNullAssertionID) {
+            IOPMAssertionRelease(powerAssertionID)
+            powerAssertionID = IOPMAssertionID(kIOPMNullAssertionID)
+        }
 
         let sem = DispatchSemaphore(value: 0)
         Task.detached { [stream] in

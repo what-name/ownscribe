@@ -35,8 +35,12 @@ def _dir_size(path: str) -> str:
 @click.option("--no-summarize", is_flag=True, help="Skip LLM summarization.")
 @click.option("--diarize", is_flag=True, help="Enable speaker diarization (needs HF token).")
 @click.option("--format", "output_format", type=click.Choice(["markdown", "json"]), default=None, help="Output format.")
+@click.option(
+    "--engine", type=click.Choice(["parakeet", "whisperx"]), default=None,
+    help="Transcription engine (default: parakeet). --model / --language / --initial-prompt / --hotwords apply to whisperx only.",
+)
 @click.option("--model", default=None, help="Whisper model size (tiny, base, small, medium, large-v3).")
-@click.option("--language", default=None, help="Language code for transcription (e.g. en, de, fr).")
+@click.option("--language", default=None, help="Language code (e.g. en, de, fr).")
 @click.option("--initial-prompt", default=None, help="Context text to prime Whisper (vocab, speaker names, etc.)")
 @click.option("--hotwords", default=None, help="Comma-separated words to boost Whisper recognition.")
 @click.option("--mic", is_flag=True, help="Also capture microphone input (mixed with system audio).")
@@ -58,6 +62,7 @@ def cli(
     no_summarize: bool,
     diarize: bool,
     output_format: str | None,
+    engine: str | None,
     model: str | None,
     language: str | None,
     initial_prompt: str | None,
@@ -86,6 +91,8 @@ def cli(
         config.diarization.enabled = True
     if output_format:
         config.output.format = output_format
+    if engine:
+        config.transcription.engine = engine
     if model:
         config.transcription.model = model
     if language:
@@ -141,18 +148,24 @@ def devices() -> None:
 @cli.command()
 @click.argument("file", type=click.Path(exists=True))
 @click.option("--diarize", is_flag=True, help="Enable speaker diarization.")
-@click.option("--model", default=None, help="Whisper model size.")
-@click.option("--language", default=None, help="Language code for transcription (e.g. en, de, fr).")
+@click.option(
+    "--engine", type=click.Choice(["parakeet", "whisperx"]), default=None,
+    help="Transcription engine (default: parakeet).",
+)
+@click.option("--model", default=None, help="Whisper model size (whisperx only).")
+@click.option("--language", default=None, help="Language code (whisperx only).")
 @click.option("--format", "output_format", type=click.Choice(["markdown", "json"]), default=None)
 @click.pass_context
 def transcribe(
     ctx: click.Context, file: str, diarize: bool,
-    model: str | None, language: str | None, output_format: str | None,
+    engine: str | None, model: str | None, language: str | None, output_format: str | None,
 ) -> None:
     """Transcribe an audio file."""
     config = ctx.obj["config"]
     if diarize:
         config.diarization.enabled = True
+    if engine:
+        config.transcription.engine = engine
     if model:
         config.transcription.model = model
     if language:

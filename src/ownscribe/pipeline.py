@@ -90,11 +90,32 @@ def _create_recorder(config: Config):
     return SoundDeviceRecorder(device=device, silence_timeout=config.audio.silence_timeout)
 
 
+def _is_parakeet(config: Config) -> bool:
+    return config.transcription.engine == "parakeet"
+
+
+def _diarization_enabled(config: Config) -> bool:
+    """Whether diarization will actually run, accounting for engine requirements.
+
+    WhisperX/pyannote needs an HF token; Parakeet/FluidAudio does not.
+    """
+    if not config.diarization.enabled:
+        return False
+    if _is_parakeet(config):
+        return True
+    return bool(config.diarization.hf_token)
+
+
 def _create_transcriber(config: Config, progress=None):
-    """Create the WhisperX transcriber."""
+    """Create the transcriber for the configured engine."""
+    diar_config = config.diarization if config.diarization.enabled else None
+    if _is_parakeet(config):
+        from ownscribe.transcription.parakeet_transcriber import ParakeetTranscriber
+
+        return ParakeetTranscriber(config.transcription, diar_config, progress=progress)
+
     from ownscribe.transcription.whisperx_transcriber import WhisperXTranscriber
 
-    diar_config = config.diarization if config.diarization.enabled else None
     return WhisperXTranscriber(config.transcription, diar_config, progress=progress)
 
 
@@ -267,8 +288,9 @@ def run_transcribe(config: Config, audio_file: str) -> None:
 
 def run_warmup(config: Config) -> None:
     """Prefetch transcription/diarization models without processing audio."""
-    diar_enabled = config.diarization.enabled and bool(config.diarization.hf_token)
-    hf_token_warning = config.diarization.enabled and not config.diarization.hf_token
+    parakeet = _is_parakeet(config)
+    diar_enabled = _diarization_enabled(config)
+    hf_token_warning = (not parakeet) and config.diarization.enabled and not config.diarization.hf_token
     local_sum = config.summarization.enabled and config.summarization.backend == "local"
 
     with PipelineProgress(
@@ -299,19 +321,24 @@ def run_warmup(config: Config) -> None:
                 click.echo(f"Error: {exc}", err=True)
                 raise SystemExit(1) from None
 
-    click.echo(f"Whisper model ready: {config.transcription.model}")
-    if config.transcription.language:
-        click.echo(f"Alignment model ready: {config.transcription.language}")
+    if parakeet:
+        click.echo(f"Parakeet model ready: {config.transcription.parakeet_model}")
+        if diar_enabled:
+            click.echo("Diarization models load on first diarized transcription.")
     else:
-        click.echo("Alignment model not preloaded (language auto-detect).")
+        click.echo(f"Whisper model ready: {config.transcription.model}")
+        if config.transcription.language:
+            click.echo(f"Alignment model ready: {config.transcription.language}")
+        else:
+            click.echo("Alignment model not preloaded (language auto-detect).")
 
-    if diar_enabled:
-        click.echo("Diarization pipeline ready.")
-    elif hf_token_warning:
-        click.echo(
-            "Warning: Diarization enabled but no HF token configured. Skipping diarization warmup.",
-            err=True,
-        )
+        if diar_enabled:
+            click.echo("Diarization pipeline ready.")
+        elif hf_token_warning:
+            click.echo(
+                "Warning: Diarization enabled but no HF token configured. Skipping diarization warmup.",
+                err=True,
+            )
 
     if local_sum:
         click.echo(f"Summarization model ready: {config.summarization.model}")
@@ -399,7 +426,9 @@ def _do_transcribe_and_summarize(
     summarize: bool = True,
 ) -> None:
     """Shared logic for transcribe + optional summarize."""
-    diar_enabled = config.diarization.enabled and bool(config.diarization.hf_token)
+    # Parakeet folds speaker work into the transcribing step (no pyannote substeps),
+    # so only WhisperX shows the dedicated "Diarizing" checklist section.
+    show_diar_steps = _diarization_enabled(config) and not _is_parakeet(config)
     sum_enabled = summarize and config.summarization.enabled
 
     summary = None
@@ -411,7 +440,7 @@ def _do_transcribe_and_summarize(
     local_sum = sum_enabled and config.summarization.backend == "local"
 
     with PipelineProgress(
-        diarize=diar_enabled,
+        diarize=show_diar_steps,
         summarize=sum_enabled,
         download_summarizer=local_sum,
     ) as progress:

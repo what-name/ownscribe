@@ -20,10 +20,12 @@ capture_mode = "picker"   # "picker" = show source picker; "all" = capture all s
 silence_timeout = 300     # seconds of silence before auto-stop; 0 = disabled
 
 [transcription]
-model = "base"            # whisper model: tiny, base, small, medium, large-v3
-language = ""             # empty = auto-detect
-# initial_prompt = ""     # prime Whisper with context: domain vocab, speaker names, expected phrases
-# hotwords = ""           # comma-separated words to boost recognition (softer hint than initial_prompt)
+engine = "parakeet"       # "parakeet" (FluidAudio, on-device, fast) or "whisperx"
+parakeet_model = "v2"     # parakeet only: "v2" (English-only, most accurate) or "v3" (multilingual)
+model = "base"            # whisperx only: tiny, base, small, medium, large-v3
+language = ""             # whisperx only: empty = auto-detect (parakeet v2 is always English)
+# initial_prompt = ""     # whisperx only: prime Whisper with context (domain vocab, speaker names)
+# hotwords = ""           # whisperx only: comma-separated words to boost recognition
 
 [diarization]
 enabled = false           # set to true + provide hf_token to enable
@@ -65,10 +67,12 @@ class AudioConfig:
 
 @dataclass
 class TranscriptionConfig:
-    model: str = "base"
-    language: str = ""
-    initial_prompt: str = ""
-    hotwords: str = ""
+    engine: str = "parakeet"  # "parakeet" (FluidAudio) or "whisperx"
+    parakeet_model: str = "v2"  # parakeet only: "v2" (English) or "v3" (multilingual)
+    model: str = "base"  # whisperx only
+    language: str = ""  # whisperx only
+    initial_prompt: str = ""  # whisperx only
+    hotwords: str = ""  # whisperx only
 
 
 @dataclass

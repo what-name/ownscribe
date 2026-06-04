@@ -90,23 +90,15 @@ def _create_recorder(config: Config):
     return SoundDeviceRecorder(device=device, silence_timeout=config.audio.silence_timeout)
 
 
-def _is_parakeet(config: Config) -> bool:
-    return config.transcription.engine == "parakeet"
-
-
 def _diarization_enabled(config: Config) -> bool:
-    """Whether diarization will actually run.
-
-    Both engines diarize with pyannote (better speaker separation on meeting
-    audio than FluidAudio's clustering), which needs a HuggingFace token.
-    """
+    """Whether diarization will actually run (pyannote needs an HF token)."""
     return config.diarization.enabled and bool(config.diarization.hf_token)
 
 
 def _create_transcriber(config: Config, progress=None):
     """Create the transcriber for the configured engine."""
     diar_config = config.diarization if config.diarization.enabled else None
-    if _is_parakeet(config):
+    if config.transcription.engine == "parakeet":
         from ownscribe.transcription.parakeet_transcriber import ParakeetTranscriber
 
         return ParakeetTranscriber(config.transcription, diar_config, progress=progress)
@@ -285,7 +277,7 @@ def run_transcribe(config: Config, audio_file: str) -> None:
 
 def run_warmup(config: Config) -> None:
     """Prefetch transcription/diarization models without processing audio."""
-    parakeet = _is_parakeet(config)
+    parakeet = config.transcription.engine == "parakeet"
     diar_enabled = _diarization_enabled(config)
     hf_token_warning = config.diarization.enabled and not config.diarization.hf_token
     local_sum = config.summarization.enabled and config.summarization.backend == "local"
@@ -328,12 +320,9 @@ def run_warmup(config: Config) -> None:
             click.echo("Alignment model not preloaded (language auto-detect).")
 
     if diar_enabled:
-        if parakeet:
-            # Parakeet warms only ASR; its pyannote diarizer loads on first run.
-            click.echo("Diarization (pyannote) will load on first diarized transcription.")
-        else:
-            # WhisperX prefetches its pyannote pipeline during prepare_models.
-            click.echo("Diarization pipeline ready.")
+        # WhisperX prefetches pyannote during prepare_models; Parakeet defers it
+        # to the first diarized transcription. Either way: token is set, it'll run.
+        click.echo("Diarization (pyannote) configured.")
     elif hf_token_warning:
         click.echo(
             "Warning: Diarization enabled but no HF token configured. Skipping diarization.",
@@ -426,9 +415,7 @@ def _do_transcribe_and_summarize(
     summarize: bool = True,
 ) -> None:
     """Shared logic for transcribe + optional summarize."""
-    # Both engines diarize with pyannote, which reports the segmentation/embedding/
-    # clustering sub-steps through the progress hook.
-    show_diar_steps = _diarization_enabled(config)
+    diar_enabled = _diarization_enabled(config)
     sum_enabled = summarize and config.summarization.enabled
 
     summary = None
@@ -440,7 +427,7 @@ def _do_transcribe_and_summarize(
     local_sum = sum_enabled and config.summarization.backend == "local"
 
     with PipelineProgress(
-        diarize=show_diar_steps,
+        diarize=diar_enabled,
         summarize=sum_enabled,
         download_summarizer=local_sum,
     ) as progress:

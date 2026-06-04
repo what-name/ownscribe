@@ -37,7 +37,7 @@ def _dir_size(path: str) -> str:
 @click.option("--format", "output_format", type=click.Choice(["markdown", "json"]), default=None, help="Output format.")
 @click.option(
     "--engine", type=click.Choice(["parakeet", "whisperx"]), default=None,
-    help="Transcription engine (default: parakeet). --model / --language / --initial-prompt / --hotwords apply to whisperx only.",
+    help="Transcription engine (default: parakeet). --model/--language/--initial-prompt/--hotwords are whisperx-only.",
 )
 @click.option("--model", default=None, help="Whisper model size (tiny, base, small, medium, large-v3).")
 @click.option("--language", default=None, help="Language code (e.g. en, de, fr).")
@@ -150,10 +150,10 @@ def devices() -> None:
 @click.option("--diarize", is_flag=True, help="Enable speaker diarization.")
 @click.option(
     "--engine", type=click.Choice(["parakeet", "whisperx"]), default=None,
-    help="Transcription engine (default: parakeet).",
+    help="Transcription engine (default: parakeet). --model and --language apply to whisperx only.",
 )
-@click.option("--model", default=None, help="Whisper model size (whisperx only).")
-@click.option("--language", default=None, help="Language code (whisperx only).")
+@click.option("--model", default=None, help="Whisper model size.")
+@click.option("--language", default=None, help="Language code (e.g. en, de, fr).")
 @click.option("--format", "output_format", type=click.Choice(["markdown", "json"]), default=None)
 @click.pass_context
 def transcribe(

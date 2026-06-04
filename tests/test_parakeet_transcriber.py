@@ -47,12 +47,12 @@ class TestSegmentation:
         assert segs[1].text == "yes"
 
     def test_splits_on_long_pause(self):
-        from ownscribe.transcription.parakeet_transcriber import _segment_words
+        from ownscribe.transcription.parakeet_transcriber import _PAUSE_GAP_SECONDS, _segment_words
 
         words = _words(
             ("one", 0.0, 0.3, None),
             ("two", 0.3, 0.6, None),
-            ("three", 5.0, 5.3, None),  # >1s gap
+            ("three", 0.6 + _PAUSE_GAP_SECONDS + 0.1, 0.9 + _PAUSE_GAP_SECONDS + 0.1, None),
         )
         segs = _segment_words(words)
         assert len(segs) == 2

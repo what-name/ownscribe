@@ -11,8 +11,8 @@ segments on punctuation, speaker changes, and pauses.
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 
@@ -37,19 +37,12 @@ _SENTENCE_ENDINGS = (".", "!", "?")
 _PAUSE_GAP_SECONDS = 2.0
 _MAX_SEGMENT_SECONDS = 30.0  # hard cap so a punctuation-free stream still splits
 
-# Binary discovery — mirror audio/coreaudio.py.
-_BINARY_CANDIDATES = [
-    Path(__file__).resolve().parents[3] / "bin" / "ownscribe-transcribe",  # dev: repo root
-    Path(sys.prefix) / "bin" / "ownscribe-transcribe",
-]
+_DEV_BINARY = Path(__file__).resolve().parents[3] / "bin" / "ownscribe-transcribe"
 
 
 def _find_binary() -> Path | None:
-    import shutil
-
-    for candidate in _BINARY_CANDIDATES:
-        if candidate.exists() and candidate.is_file():
-            return candidate
+    if _DEV_BINARY.exists() and _DEV_BINARY.is_file():
+        return _DEV_BINARY
     found = shutil.which("ownscribe-transcribe")
     return Path(found) if found else None
 
@@ -67,11 +60,11 @@ class ParakeetTranscriber(Transcriber):
         self._diar_config = diarization_config
         self._progress = progress or NullProgress()
         self._binary = _find_binary()
+        self._diarize_pipeline = None
 
     @property
     def _model_version(self) -> str:
-        version = getattr(self._tx_config, "parakeet_model", "v2") or "v2"
-        return "v3" if str(version).lower() == "v3" else "v2"
+        return "v3" if self._tx_config.parakeet_model == "v3" else "v2"
 
     def _should_diarize(self) -> bool:
         # Diarization runs via pyannote (better separation than FluidAudio on
@@ -141,8 +134,6 @@ class ParakeetTranscriber(Transcriber):
             ]
 
             progress.begin("transcribing")
-            progress.set_detail("transcribing", f"Loading Parakeet model ({self._model_version})")
-
             stderr_lines = self._run_with_progress(cmd)
 
             if not out_path.exists():
@@ -169,6 +160,22 @@ class ParakeetTranscriber(Transcriber):
             duration=float(data.get("duration", 0.0)),
         )
 
+    def _load_diarize_pipeline(self):
+        """Lazily build (and cache) the pyannote pipeline."""
+        if self._diarize_pipeline is not None:
+            return self._diarize_pipeline
+
+        import contextlib
+        import os
+
+        from whisperx.diarize import DiarizationPipeline
+
+        with open(os.devnull, "w") as devnull, contextlib.redirect_stdout(devnull):
+            self._diarize_pipeline = DiarizationPipeline(
+                token=self._diar_config.hf_token, device=self._diarization_device()
+            )
+        return self._diarize_pipeline
+
     def _diarize_pyannote(self, audio_path: Path) -> list[tuple[str, float, float]]:
         """Run pyannote diarization and return (speaker, start, end) spans.
 
@@ -191,12 +198,9 @@ class ParakeetTranscriber(Transcriber):
                 warnings.simplefilter("ignore")
                 import torch
                 import whisperx
-                from whisperx.diarize import DiarizationPipeline
 
+                pipeline = self._load_diarize_pipeline()
                 with open(os.devnull, "w") as devnull, contextlib.redirect_stdout(devnull):
-                    pipeline = DiarizationPipeline(
-                        token=self._diar_config.hf_token, device=self._diarization_device()
-                    )
                     audio = whisperx.load_audio(str(audio_path))
                     audio_data = {"waveform": torch.from_numpy(audio[None, :]), "sample_rate": 16000}
 

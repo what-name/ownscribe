@@ -22,7 +22,9 @@ uv run ruff format src/ tests/       # auto-format
 Each stage has a base class in its subpackage and one or more implementations:
 
 - **Audio** (`audio/base.py`): `CoreAudioRecorder` (macOS, wraps a Swift binary in `swift/`) and `SoundDeviceRecorder` (cross-platform fallback). Selected in `pipeline.py:_create_recorder()`.
-- **Transcription** (`transcription/base.py`): `WhisperXTranscriber` (single impl). Data models (`Segment`, `Word`, `TranscriptResult`) live in `transcription/models.py`.
+- **Transcription** (`transcription/base.py`): `ParakeetTranscriber` (default) and `WhisperXTranscriber`, selected by `config.transcription.engine` in `pipeline.py:_create_transcriber()`. Data models (`Segment`, `Word`, `TranscriptResult`) live in `transcription/models.py`.
+  - **Parakeet** shells out to the `ownscribe-transcribe` Swift binary (built from `swift/transcribe/` via SPM + FluidAudio), which runs Parakeet TDT ASR on the Apple Neural Engine and writes word-level JSON. English-only (v2), ~150-240x realtime. The Python side then runs **pyannote** diarization (when enabled + HF token present) and assigns speakers to words by time-overlap, then segments into `TranscriptResult`. (The Swift binary can also do FluidAudio diarization via `--diar-mode`, but ownscribe uses pyannote — better separation on meeting audio.)
+  - **WhisperX** is the legacy engine (faster-whisper + wav2vec2 alignment + pyannote diarization). Both engines diarize via pyannote and need an HF token for it.
 - **Summarization** (`summarization/base.py`): `LlamaCppSummarizer` (default, local inference via `llama-cpp-python`), `OllamaSummarizer`, and `OpenAISummarizer`. Factory is `summarization/__init__.py:create_summarizer()` — used by both `pipeline.py` and `search.py`.
 - **Output** (`output/`): `markdown.py` and `json_output.py`, selected by `config.output.format`.
 

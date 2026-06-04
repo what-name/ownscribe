@@ -43,8 +43,8 @@ All audio, transcripts, and summaries remain local.
 
 - **System audio capture** — records all system audio natively via Core Audio Taps (macOS 14.2+), no virtual audio drivers needed
 - **Microphone capture** — optionally record system + mic audio simultaneously with `--mic`
-- **WhisperX transcription** — fast, accurate speech-to-text with word-level timestamps
-- **Speaker diarization** — optional speaker identification via pyannote (requires HuggingFace token)
+- **On-device transcription** — Parakeet v2 by default (English, via [FluidAudio](https://github.com/FluidInference/FluidAudio), ~150-240x realtime on Apple Silicon) or WhisperX; both produce word-level timestamps
+- **Speaker diarization** — speaker identification via pyannote (both engines), on the Apple Silicon GPU; requires a HuggingFace token
 - **Pipeline progress** — live checklist showing transcription, diarization sub-steps, and summarization progress
 - **Local LLM summarization** — structured meeting notes with a built-in model (Phi-4-mini); also supports Ollama, LM Studio, or any OpenAI-compatible server
 - **Summarization templates** — built-in presets for meetings, lectures, and quick briefs; define your own in config
@@ -102,6 +102,9 @@ cd ownscribe
 # Build the Swift audio capture helper (optional - auto-downloads if skipped)
 bash swift/build.sh
 
+# Build the Parakeet transcription helper (required for the default engine)
+bash swift/transcribe/build.sh
+
 # Install with all backends
 uv sync --extra all
 ```
@@ -120,7 +123,7 @@ This will:
 3. Summarize with your local LLM
 4. Save everything to `~/ownscribe/YYYY-MM-DD_HHMMSS/`
 
-On first run, WhisperX / pyannote and the summarization model may download model files. ownscribe shows a `Preparing models` step and best-effort download progress in the TUI while this happens. Use `ownscribe warmup` to pre-download all models.
+On first run, the transcription models (Parakeet via FluidAudio, or WhisperX), the pyannote diarization models, and the summarization model may download. The first Parakeet run also compiles the CoreML models for the Apple Neural Engine, which can take a few minutes once; subsequent runs are fast. Use `ownscribe warmup` to pre-download and pre-compile the transcription model.
 
 ### Options
 
@@ -190,8 +193,10 @@ mic_device = ""           # specific mic device name (empty = default)
 silence_timeout = 300     # seconds of silence before auto-stop; 0 = disabled
 
 [transcription]
-model = "base"            # tiny, base, small, medium, large-v3
-language = ""             # empty = auto-detect
+engine = "parakeet"       # "parakeet" (FluidAudio, on-device, fast) or "whisperx"
+parakeet_model = "v2"     # parakeet only: "v2" (English-only, most accurate) or "v3" (multilingual)
+model = "base"            # whisperx only: tiny, base, small, medium, large-v3
+language = ""             # whisperx only: empty = auto-detect (parakeet v2 is always English)
 
 [diarization]
 enabled = false
@@ -244,7 +249,7 @@ Then use with `--template my-standup` or `template = "my-standup"` in config.
 
 ## Speaker Diarization
 
-Speaker identification requires a HuggingFace token with access to the pyannote diarization model:
+Speaker identification uses **pyannote** for both engines (Parakeet transcribes, pyannote labels who speaks when, and words are matched to speakers by time overlap). Separation is strongest on meeting-length audio; very short clips with a brief second speaker may collapse to a single speaker. It requires a HuggingFace token with access to the pyannote diarization model:
 
 1. Accept the terms for [pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1) on HuggingFace
 2. Create a token at https://huggingface.co/settings/tokens
@@ -257,6 +262,8 @@ On Apple Silicon Macs, diarization automatically uses the Metal Performance Shad
 
 ownscribe builds on some excellent open-source projects:
 
+- [FluidAudio](https://github.com/FluidInference/FluidAudio) — on-device Parakeet ASR (CoreML / Apple Neural Engine)
+- [Parakeet](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) — NVIDIA's TDT speech recognition model
 - [WhisperX](https://github.com/m-bain/whisperX) — fast speech recognition with word-level timestamps and speaker diarization
 - [faster-whisper](https://github.com/SYSTRAN/faster-whisper) — CTranslate2-based Whisper inference
 - [pyannote.audio](https://github.com/pyannote/pyannote-audio) — speaker diarization

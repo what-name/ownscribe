@@ -28,6 +28,7 @@ bin/
 
 # Swift build artifacts
 swift/.build/
+swift/transcribe/.build/
 
 # Config with secrets
 .env

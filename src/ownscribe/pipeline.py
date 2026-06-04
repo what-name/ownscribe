@@ -105,11 +105,21 @@ def _create_recorder(config: Config):
     return SoundDeviceRecorder(device=device, silence_timeout=config.audio.silence_timeout)
 
 
+def _diarization_enabled(config: Config) -> bool:
+    """Whether diarization will actually run (pyannote needs an HF token)."""
+    return config.diarization.enabled and bool(config.diarization.hf_token)
+
+
 def _create_transcriber(config: Config, progress=None):
-    """Create the WhisperX transcriber."""
+    """Create the transcriber for the configured engine."""
+    diar_config = config.diarization if config.diarization.enabled else None
+    if config.transcription.engine == "parakeet":
+        from ownscribe.transcription.parakeet_transcriber import ParakeetTranscriber
+
+        return ParakeetTranscriber(config.transcription, diar_config, progress=progress)
+
     from ownscribe.transcription.whisperx_transcriber import WhisperXTranscriber
 
-    diar_config = config.diarization if config.diarization.enabled else None
     return WhisperXTranscriber(config.transcription, diar_config, progress=progress)
 
 
@@ -297,7 +307,8 @@ def run_transcribe(config: Config, audio_file: str) -> None:
 
 def run_warmup(config: Config) -> None:
     """Prefetch transcription/diarization models without processing audio."""
-    diar_enabled = config.diarization.enabled and bool(config.diarization.hf_token)
+    parakeet = config.transcription.engine == "parakeet"
+    diar_enabled = _diarization_enabled(config)
     hf_token_warning = config.diarization.enabled and not config.diarization.hf_token
     local_sum = config.summarization.enabled and config.summarization.backend == "local"
 
@@ -329,17 +340,22 @@ def run_warmup(config: Config) -> None:
                 click.echo(f"Error: {exc}", err=True)
                 raise SystemExit(1) from None
 
-    click.echo(f"Whisper model ready: {config.transcription.model}")
-    if config.transcription.language:
-        click.echo(f"Alignment model ready: {config.transcription.language}")
+    if parakeet:
+        click.echo(f"Parakeet model ready: {config.transcription.parakeet_model}")
     else:
-        click.echo("Alignment model not preloaded (language auto-detect).")
+        click.echo(f"Whisper model ready: {config.transcription.model}")
+        if config.transcription.language:
+            click.echo(f"Alignment model ready: {config.transcription.language}")
+        else:
+            click.echo("Alignment model not preloaded (language auto-detect).")
 
     if diar_enabled:
-        click.echo("Diarization pipeline ready.")
+        # WhisperX prefetches pyannote during prepare_models; Parakeet defers it
+        # to the first diarized transcription. Either way: token is set, it'll run.
+        click.echo("Diarization (pyannote) configured.")
     elif hf_token_warning:
         click.echo(
-            "Warning: Diarization enabled but no HF token configured. Skipping diarization warmup.",
+            "Warning: Diarization enabled but no HF token configured. Skipping diarization.",
             err=True,
         )
 
@@ -429,7 +445,7 @@ def _do_transcribe_and_summarize(
     summarize: bool = True,
 ) -> None:
     """Shared logic for transcribe + optional summarize."""
-    diar_enabled = config.diarization.enabled and bool(config.diarization.hf_token)
+    diar_enabled = _diarization_enabled(config)
     sum_enabled = summarize and config.summarization.enabled
 
     summary = None

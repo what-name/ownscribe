@@ -208,11 +208,9 @@ class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, SCContentS
     // Timestamp for sync alignment
     private(set) var startHostTime: UInt64 = 0
 
-    // Silence detection
+    // Silence detection (final stop-time check only — see stop())
     private var peakLevel: Float = 0.0
     private var totalFrames: Int64 = 0
-    private var silenceChecked: Bool = false
-    private var silenceWarned: Bool = false
 
     // Silence timeout auto-stop
     var silenceTimeout: TimeInterval = 0  // seconds; 0 = disabled
@@ -426,19 +424,9 @@ class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, SCContentS
             os_unfair_lock_unlock(&lastLoudTimeLock)
         }
 
-        // Check for silence after ~3 seconds of data
-        if !silenceChecked && Double(totalFrames) > kSystemAudioSampleRate * 3 {
-            silenceChecked = true
-            if peakLevel < 1e-6 {
-                silenceWarned = true
-                if micCapture != nil {
-                    fputs("[SILENCE_WARNING] System audio is silent (mic is still recording). No system audio sources detected.\n", stderr)
-                } else {
-                    fputs("[SILENCE_WARNING] Audio data received but peak level is near zero (\(peakLevel)). Audio may be silent.\n", stderr)
-                    fputs("Check: System Settings > Privacy & Security > Screen Recording — enable your terminal app.\n", stderr)
-                }
-            }
-        }
+        // Silence detection lives in stop() — a global peak check across the
+        // whole recording, so a quiet start (greeting, waiting for host)
+        // doesn't trigger a false positive.
     }
 
     // MARK: - SCStreamDelegate

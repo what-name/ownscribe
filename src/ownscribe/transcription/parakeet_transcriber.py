@@ -186,6 +186,16 @@ class ParakeetTranscriber(Transcriber):
         import os
         import warnings
 
+        # whisperx.load_audio shells out to ffmpeg. Fail fast with a clear message
+        # rather than losing the just-computed ASR result to an opaque exception.
+        if not shutil.which("ffmpeg"):
+            click.echo(
+                "Error: ffmpeg is not installed. Diarization requires ffmpeg for audio decoding.\n"
+                "Install with: brew install ffmpeg",
+                err=True,
+            )
+            raise SystemExit(1)
+
         os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
         if not (self._diar_config and self._diar_config.telemetry):
             os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")

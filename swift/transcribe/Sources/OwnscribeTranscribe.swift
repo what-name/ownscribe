@@ -183,7 +183,7 @@ struct OwnscribeTranscribe {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             let data = try encoder.encode(out)
-            try data.write(to: URL(fileURLWithPath: outputPath))
+            try data.write(to: URL(fileURLWithPath: outputPath), options: [.atomic])
             progress("[DONE]")
         } catch {
             die("\(error)")

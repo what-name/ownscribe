@@ -73,9 +73,18 @@ class ParakeetTranscriber(Transcriber):
         version = getattr(self._tx_config, "parakeet_model", "v2") or "v2"
         return "v3" if str(version).lower() == "v3" else "v2"
 
-    @property
-    def _diarize(self) -> bool:
-        return bool(self._diar_config and self._diar_config.enabled)
+    def _should_diarize(self) -> bool:
+        # Diarization runs via pyannote (better separation than FluidAudio on
+        # meeting audio), which needs a HuggingFace token.
+        return bool(self._diar_config and self._diar_config.enabled and self._diar_config.hf_token)
+
+    def _diarization_device(self) -> str:
+        cfg = self._diar_config.device if self._diar_config else "auto"
+        if cfg == "auto":
+            import torch
+
+            return "mps" if torch.backends.mps.is_available() else "cpu"
+        return cfg
 
     def _require_binary(self) -> Path:
         if self._binary is None:
@@ -121,6 +130,7 @@ class ParakeetTranscriber(Transcriber):
 
         with tempfile.TemporaryDirectory() as tmp:
             out_path = Path(tmp) / "result.json"
+            # ASR only — diarization is handled separately by pyannote below.
             cmd = [
                 str(binary),
                 str(audio_path),
@@ -129,8 +139,6 @@ class ParakeetTranscriber(Transcriber):
                 "--model",
                 self._model_version,
             ]
-            if self._diarize:
-                cmd.append("--diarize")
 
             progress.begin("transcribing")
             progress.set_detail("transcribing", f"Loading Parakeet model ({self._model_version})")
@@ -149,7 +157,66 @@ class ParakeetTranscriber(Transcriber):
             data = json.loads(out_path.read_text())
 
         progress.complete("transcribing")
-        return self._build_result(data)
+
+        words = _parse_words(data)
+        if self._should_diarize():
+            spans = self._diarize_pyannote(audio_path)
+            _assign_speakers(words, spans)
+
+        return TranscriptResult(
+            segments=_segment_words(words),
+            language=str(data.get("language", "")),
+            duration=float(data.get("duration", 0.0)),
+        )
+
+    def _diarize_pyannote(self, audio_path: Path) -> list[tuple[str, float, float]]:
+        """Run pyannote diarization and return (speaker, start, end) spans.
+
+        Calling pyannote directly (rather than through whisperx's word-assignment)
+        avoids the phantom-speaker artifacts that layer introduced.
+        """
+        import contextlib
+        import os
+        import warnings
+
+        os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
+        if not (self._diar_config and self._diar_config.telemetry):
+            os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+            os.environ.setdefault("PYANNOTE_METRICS_ENABLED", "0")
+
+        progress = self._progress
+        progress.begin("diarizing")
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                import torch
+                import whisperx
+                from whisperx.diarize import DiarizationPipeline
+
+                with open(os.devnull, "w") as devnull, contextlib.redirect_stdout(devnull):
+                    pipeline = DiarizationPipeline(
+                        token=self._diar_config.hf_token, device=self._diarization_device()
+                    )
+                    audio = whisperx.load_audio(str(audio_path))
+                    audio_data = {"waveform": torch.from_numpy(audio[None, :]), "sample_rate": 16000}
+
+                    kwargs: dict = {}
+                    if self._diar_config.min_speakers > 0:
+                        kwargs["min_speakers"] = self._diar_config.min_speakers
+                    if self._diar_config.max_speakers > 0:
+                        kwargs["max_speakers"] = self._diar_config.max_speakers
+                    hook = getattr(progress, "diarization_hook", None)
+                    diarization = pipeline.model(audio_data, hook=hook, **kwargs)
+
+            spans = [
+                (str(speaker), float(segment.start), float(segment.end))
+                for segment, _label, speaker in diarization.speaker_diarization.itertracks(yield_label=True)
+            ]
+            progress.complete("diarizing")
+            return spans
+        except Exception:
+            progress.fail("diarizing")
+            raise
 
     def _run_with_progress(self, cmd: list[str]) -> list[str]:
         """Run the helper, mapping its stderr markers onto progress detail lines."""
@@ -173,34 +240,42 @@ class ParakeetTranscriber(Transcriber):
         proc.wait()
         return stderr_lines
 
-    def _build_result(self, data: dict) -> TranscriptResult:
-        words_raw = data.get("words", [])
-        words = [
-            Word(
-                text=str(w.get("word", "")),
-                start=float(w.get("start", 0.0)),
-                end=float(w.get("end", 0.0)),
-                speaker=_normalize_speaker(w.get("speaker")),
-                score=float(w.get("confidence", 0.0)),
-            )
-            for w in words_raw
-        ]
-        segments = _segment_words(words)
-        return TranscriptResult(
-            segments=segments,
-            language=str(data.get("language", "")),
-            duration=float(data.get("duration", 0.0)),
+def _parse_words(data: dict) -> list[Word]:
+    """Build Word objects from the helper's JSON (speakers assigned separately)."""
+    return [
+        Word(
+            text=str(w.get("word", "")),
+            start=float(w.get("start", 0.0)),
+            end=float(w.get("end", 0.0)),
+            speaker=None,
+            score=float(w.get("confidence", 0.0)),
         )
+        for w in data.get("words", [])
+    ]
 
 
-def _normalize_speaker(speaker: object) -> str | None:
-    """Render FluidAudio's bare numeric speaker ids (e.g. "1") as "Speaker 1"."""
-    if speaker is None:
-        return None
-    text = str(speaker).strip()
-    if not text:
-        return None
-    return f"Speaker {text}" if text.isdigit() else text
+def _assign_speakers(words: list[Word], spans: list[tuple[str, float, float]]) -> None:
+    """Label each word with a speaker by overlapping its midpoint with diarization
+    spans. Words whose midpoint falls in no span are given the nearest span's speaker.
+    Mutates ``words`` in place.
+    """
+    if not spans:
+        return
+
+    def gap(mid: float, span: tuple[str, float, float]) -> float:
+        _, start, end = span
+        if mid < start:
+            return start - mid
+        if mid > end:
+            return mid - end
+        return 0.0
+
+    for word in words:
+        mid = (word.start + word.end) / 2.0
+        match = next((s for s in spans if s[1] <= mid <= s[2]), None)
+        if match is None:
+            match = min(spans, key=lambda s: gap(mid, s))
+        word.speaker = match[0]
 
 
 def _segment_words(words: list[Word]) -> list[Segment]:

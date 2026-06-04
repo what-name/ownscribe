@@ -77,45 +77,49 @@ class TestSegmentation:
         assert _segment_words([]) == []
 
 
-class TestNormalizeSpeaker:
-    def test_numeric_ids_become_speaker_labels(self):
-        from ownscribe.transcription.parakeet_transcriber import _normalize_speaker
+class TestParseWords:
+    def test_parses_json_words_without_speakers(self):
+        from ownscribe.transcription.parakeet_transcriber import _parse_words
 
-        assert _normalize_speaker("1") == "Speaker 1"
-        assert _normalize_speaker("2") == "Speaker 2"
-        assert _normalize_speaker("Speaker 1") == "Speaker 1"
-        assert _normalize_speaker(None) is None
-        assert _normalize_speaker("") is None
-
-
-class TestBuildResult:
-    def test_parses_json_into_transcript_result(self):
-        from ownscribe.config import DiarizationConfig, TranscriptionConfig
-        from ownscribe.transcription.parakeet_transcriber import ParakeetTranscriber
-
-        tx = ParakeetTranscriber(
-            TranscriptionConfig(engine="parakeet"),
-            DiarizationConfig(enabled=True),
-            progress=None,
-        )
         data = {
-            "text": "Hello there. Yes.",
-            "language": "en",
-            "duration": 3.2,
-            "diarized": True,
             "words": [
-                {"word": "Hello", "start": 0.0, "end": 0.4, "confidence": 0.95, "speaker": "Speaker 1"},
-                {"word": "there.", "start": 0.4, "end": 0.8, "confidence": 0.9, "speaker": "Speaker 1"},
-                {"word": "Yes.", "start": 1.0, "end": 1.3, "confidence": 0.8, "speaker": "Speaker 2"},
-            ],
+                {"word": "Hello", "start": 0.0, "end": 0.4, "confidence": 0.95},
+                {"word": "there.", "start": 0.4, "end": 0.8, "confidence": 0.9},
+            ]
         }
-        result = tx._build_result(data)
-        assert result.language == "en"
-        assert result.duration == 3.2
-        assert result.has_speakers
-        assert len(result.segments) == 2
-        assert result.segments[0].words[0].score == 0.95
-        assert "Hello there." in result.full_text
+        words = _parse_words(data)
+        assert [w.text for w in words] == ["Hello", "there."]
+        assert words[0].score == 0.95
+        assert all(w.speaker is None for w in words)  # speakers assigned later via pyannote
+
+
+class TestAssignSpeakers:
+    def test_overlap_assignment_by_midpoint(self):
+        from ownscribe.transcription.parakeet_transcriber import _assign_speakers
+
+        words = _words(
+            ("Hello", 0.0, 0.4, None),
+            ("there", 0.4, 0.8, None),
+            ("yes", 13.0, 13.4, None),
+        )
+        spans = [("SPEAKER_00", 0.0, 12.3), ("SPEAKER_01", 12.3, 18.1)]
+        _assign_speakers(words, spans)
+        assert [w.speaker for w in words] == ["SPEAKER_00", "SPEAKER_00", "SPEAKER_01"]
+
+    def test_word_in_gap_uses_nearest_span(self):
+        from ownscribe.transcription.parakeet_transcriber import _assign_speakers
+
+        words = _words(("um", 10.0, 10.2, None))  # falls in the silent gap
+        spans = [("SPEAKER_00", 0.0, 5.0), ("SPEAKER_01", 11.0, 20.0)]
+        _assign_speakers(words, spans)
+        assert words[0].speaker == "SPEAKER_01"  # nearest
+
+    def test_no_spans_leaves_speakers_none(self):
+        from ownscribe.transcription.parakeet_transcriber import _assign_speakers
+
+        words = _words(("hi", 0.0, 0.4, None))
+        _assign_speakers(words, [])
+        assert words[0].speaker is None
 
 
 class TestBinaryDiscovery:
@@ -137,41 +141,61 @@ class TestBinaryDiscovery:
 
 
 class TestTranscribeFlow:
-    def test_transcribe_invokes_binary_and_parses_output(self, tmp_path):
+    def _patch_run(self, tx, payload):
+        """Return a side_effect for _run_with_progress that writes payload as JSON."""
+
+        def fake_run(cmd):
+            tx._last_cmd = cmd
+            Path(cmd[cmd.index("--output") + 1]).write_text(json.dumps(payload))
+            return []
+
+        return fake_run
+
+    def test_asr_only_command_no_diarize_flag(self, tmp_path):
+        # Diarization is handled by pyannote in Python, never via the binary flag.
         from ownscribe.config import DiarizationConfig, TranscriptionConfig
         from ownscribe.transcription.parakeet_transcriber import ParakeetTranscriber
 
         tx = ParakeetTranscriber(
             TranscriptionConfig(engine="parakeet"),
-            DiarizationConfig(enabled=True),
+            DiarizationConfig(enabled=True, hf_token="hf_x"),
         )
         tx._binary = Path("/fake/ownscribe-transcribe")
+        payload = {"text": "Hi.", "language": "en", "duration": 1.0,
+                   "words": [{"word": "Hi.", "start": 0.0, "end": 0.5, "confidence": 0.9}]}
 
-        captured_cmd = {}
-
-        def fake_run(cmd):
-            captured_cmd["cmd"] = cmd
-            out_idx = cmd.index("--output") + 1
-            out_path = Path(cmd[out_idx])
-            out_path.write_text(
-                json.dumps(
-                    {
-                        "text": "Hi.",
-                        "language": "en",
-                        "duration": 1.0,
-                        "words": [{"word": "Hi.", "start": 0.0, "end": 0.5, "confidence": 0.9, "speaker": "Speaker 1"}],
-                    }
-                )
-            )
-            return []
-
-        with mock.patch.object(tx, "_run_with_progress", side_effect=fake_run):
+        with (
+            mock.patch.object(tx, "_run_with_progress", side_effect=self._patch_run(tx, payload)),
+            mock.patch.object(tx, "_diarize_pyannote", return_value=[("SPEAKER_00", 0.0, 1.0)]) as diar,
+        ):
             result = tx.transcribe(tmp_path / "audio.wav")
 
-        assert "--diarize" in captured_cmd["cmd"]
-        assert "--model" in captured_cmd["cmd"]
+        assert "--diarize" not in tx._last_cmd
+        assert "--model" in tx._last_cmd
+        diar.assert_called_once()
         assert result.segments[0].text == "Hi."
-        assert result.segments[0].speaker == "Speaker 1"
+        assert result.segments[0].speaker == "SPEAKER_00"
+
+    def test_no_diarization_without_token(self, tmp_path):
+        from ownscribe.config import DiarizationConfig, TranscriptionConfig
+        from ownscribe.transcription.parakeet_transcriber import ParakeetTranscriber
+
+        tx = ParakeetTranscriber(
+            TranscriptionConfig(engine="parakeet"),
+            DiarizationConfig(enabled=True, hf_token=""),  # no token -> no pyannote
+        )
+        tx._binary = Path("/fake/ownscribe-transcribe")
+        payload = {"text": "Hi.", "language": "en", "duration": 1.0,
+                   "words": [{"word": "Hi.", "start": 0.0, "end": 0.5, "confidence": 0.9}]}
+
+        with (
+            mock.patch.object(tx, "_run_with_progress", side_effect=self._patch_run(tx, payload)),
+            mock.patch.object(tx, "_diarize_pyannote") as diar,
+        ):
+            result = tx.transcribe(tmp_path / "audio.wav")
+
+        diar.assert_not_called()
+        assert result.segments[0].speaker is None
 
     def test_transcribe_no_output_exits(self, tmp_path):
         from ownscribe.config import TranscriptionConfig
@@ -186,29 +210,6 @@ class TestTranscribeFlow:
             pytest.raises(SystemExit),
         ):
             tx.transcribe(tmp_path / "audio.wav")
-
-    def test_no_diarize_flag_when_disabled(self, tmp_path):
-        from ownscribe.config import DiarizationConfig, TranscriptionConfig
-        from ownscribe.transcription.parakeet_transcriber import ParakeetTranscriber
-
-        tx = ParakeetTranscriber(
-            TranscriptionConfig(engine="parakeet"),
-            DiarizationConfig(enabled=False),
-        )
-        tx._binary = Path("/fake/ownscribe-transcribe")
-
-        captured_cmd = {}
-
-        def fake_run(cmd):
-            captured_cmd["cmd"] = cmd
-            out_path = Path(cmd[cmd.index("--output") + 1])
-            out_path.write_text(json.dumps({"text": "", "language": "en", "duration": 0.0, "words": []}))
-            return []
-
-        with mock.patch.object(tx, "_run_with_progress", side_effect=fake_run):
-            tx.transcribe(tmp_path / "audio.wav")
-
-        assert "--diarize" not in captured_cmd["cmd"]
 
 
 class TestEngineSelection:
@@ -230,24 +231,16 @@ class TestEngineSelection:
         config.transcription.engine = "whisperx"
         assert isinstance(_create_transcriber(config), WhisperXTranscriber)
 
-    def test_diarization_enabled_parakeet_needs_no_token(self):
+    def test_diarization_needs_token_both_engines(self):
+        # Both engines diarize via pyannote, which requires an HF token.
         from ownscribe.config import Config
         from ownscribe.pipeline import _diarization_enabled
 
-        config = Config()
-        config.transcription.engine = "parakeet"
-        config.diarization.enabled = True
-        config.diarization.hf_token = ""
-        assert _diarization_enabled(config) is True
-
-    def test_diarization_enabled_whisperx_needs_token(self):
-        from ownscribe.config import Config
-        from ownscribe.pipeline import _diarization_enabled
-
-        config = Config()
-        config.transcription.engine = "whisperx"
-        config.diarization.enabled = True
-        config.diarization.hf_token = ""
-        assert _diarization_enabled(config) is False
-        config.diarization.hf_token = "hf_x"
-        assert _diarization_enabled(config) is True
+        for engine in ("parakeet", "whisperx"):
+            config = Config()
+            config.transcription.engine = engine
+            config.diarization.enabled = True
+            config.diarization.hf_token = ""
+            assert _diarization_enabled(config) is False, engine
+            config.diarization.hf_token = "hf_x"
+            assert _diarization_enabled(config) is True, engine
